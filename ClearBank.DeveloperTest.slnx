@@ -1,0 +1,4 @@
+<Solution>
+  <Project Path="ClearBank.DeveloperTest.Tests/ClearBank.DeveloperTest.Tests.csproj" />
+  <Project Path="ClearBank.DeveloperTest/ClearBank.DeveloperTest.csproj" />
+</Solution>

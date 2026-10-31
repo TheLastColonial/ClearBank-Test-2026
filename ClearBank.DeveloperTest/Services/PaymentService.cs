@@ -1,107 +1,91 @@
 ﻿using ClearBank.DeveloperTest.Data;
-using ClearBank.DeveloperTest.Exceptions;
+using ClearBank.DeveloperTest.Logging;
 using ClearBank.DeveloperTest.Types;
-using ClearBank.DeveloperTest.Validators;
-using FluentValidation;
+using ClearBank.DeveloperTest.Validation;
+using FluentValidation.Results;
 using Microsoft.Extensions.Logging;
-using NodaMoney;
 using System;
 using System.Collections.Generic;
-using System.Threading.Tasks;
+using System.Linq;
 
-namespace ClearBank.DeveloperTest.Services;
-
-public class PaymentService : IPaymentService
+namespace ClearBank.DeveloperTest.Services
 {
-    private readonly ILogger<PaymentService> _logger;
-    private readonly IAccountRepository _accountRepository;
-    private readonly IMakePaymentRequestValidator _requestValidator;
-    private readonly IPaymentSchemesValidator _schemeValidator;
-
-    public PaymentService(
-        ILogger<PaymentService> logger, 
-        IAccountRepository accountRepository, 
-        IMakePaymentRequestValidator requestValidator,
-        IPaymentSchemesValidator schemeValidator
-    )
+    public class PaymentService : IPaymentService
     {
-        _logger = logger;
-        _accountRepository = accountRepository;
-        _requestValidator = requestValidator;
-        _schemeValidator = schemeValidator;
-    }
+        private readonly IAccountDataStoreFactory _dataStoreFactory;
+        private readonly IPaymentSchemeValidatorFactory _validatorFactory;
+        private readonly ILogger<PaymentService> _logger;
 
-    public async Task<MakePaymentResult> MakePayment(MakePaymentRequest request)
-    {
-        using (_logger.BeginScope(new Dictionary<string, object?>()
+        public PaymentService(
+            IAccountDataStoreFactory dataStoreFactory,
+            IPaymentSchemeValidatorFactory validatorFactory,
+            ILogger<PaymentService> logger)
         {
-            ["request.creditor-account-number"] = request?.CreditorAccountNumber,
-            ["request.debtor-account-number"] = request?.DebtorAccountNumber,
-            ["request.scheme"] = request?.PaymentScheme,
-            // ["request.amount"] = request?.Amount // Useful but might be privacy violation
-        }))
+            ArgumentNullException.ThrowIfNull(dataStoreFactory);
+            ArgumentNullException.ThrowIfNull(validatorFactory);
+            ArgumentNullException.ThrowIfNull(logger);
+
+            _dataStoreFactory = dataStoreFactory;
+            _validatorFactory = validatorFactory;
+            _logger = logger;
+        }
+
+        public MakePaymentResult MakePayment(MakePaymentRequest request)
         {
-            try
+            ArgumentNullException.ThrowIfNull(request);
+
+            using (_logger.BeginScope(ScopeFor(request)))
             {
-                ArgumentNullException.ThrowIfNull(request);
-
-                var result = _requestValidator.Validate(request);
-
-                if (!result.IsValid)
+                try
                 {
-                    throw new ValidationException(result.Errors);
+                    return Process(request);
                 }
-
-                Account account = await _accountRepository.GetAccount(request.DebtorAccountNumber)
-                    ?? throw new AccountNotFoundException(request.DebtorAccountNumber);
-
-                result = _schemeValidator.Validate(new PaymentSchemeValidationModel(request, account));
-
-                if (!result.IsValid)
+                catch (Exception exception)
                 {
-                    throw new ValidationException(result.Errors);
+                    _logger.PaymentFailed(exception);
+                    return new MakePaymentResult { Success = false };
                 }
-
-                account.Debit(Money.PoundSterling(request.Amount)); // Assumed currency due to request contract
-                await _accountRepository.UpdateAccount(account);
-
-                // no credit to target account ?
-
-                return new MakePaymentResult()
-                {
-                    Success = true
-                };
-            }
-            catch (ValidationException validationException)
-            {
-                _logger.LogWarning(validationException, "Invalid request for this account");
-
-                return new MakePaymentResult()
-                {
-                    // don't want to break contracts but would like to inform user of validation errors
-                    Success = false
-                };
-            }
-            catch (AccountNotFoundException accountNotFoundException)
-            {
-                _logger.LogWarning(accountNotFoundException, "Account Not Found");
-
-                return new MakePaymentResult()
-                {
-                    // don't want to break contracts but would like to include to contact support
-                    Success = false
-                };
-            }
-            catch (Exception exception)
-            {
-                _logger.LogError(exception, "Payment Failed Unexpectedly");
-
-                return new MakePaymentResult()
-                {
-                    // don't want to break contracts but would like to include actions to retry
-                    Success = false
-                };
             }
         }
+
+        private MakePaymentResult Process(MakePaymentRequest request)
+        {
+            var dataStore = _dataStoreFactory.Create();
+            var account = dataStore.GetAccount(request.DebtorAccountNumber);
+
+            if (account == null)
+            {
+                _logger.AccountNotFound();
+                return new MakePaymentResult { Success = false };
+            }
+
+            var failures = Validate(account, request);
+
+            if (failures.Any())
+            {
+                _logger.PaymentRejected(failures.Select(failure => failure.ErrorCode).ToList());
+                return new MakePaymentResult { Success = false };
+            }
+
+            account.Balance -= request.Amount;
+            dataStore.UpdateAccount(account);
+
+            _logger.PaymentProcessed();
+            return new MakePaymentResult { Success = true };
+        }
+
+        private IList<ValidationFailure> Validate(Account account, MakePaymentRequest request) =>
+            _validatorFactory
+                .Create(request.PaymentScheme)
+                .Validate(new PaymentValidationModel(account, request))
+                .Errors;
+
+        private static Dictionary<string, object> ScopeFor(MakePaymentRequest request) =>
+            new Dictionary<string, object>
+            {
+                ["DebtorAccount"] = AccountNumberMask.Mask(request.DebtorAccountNumber),
+                ["CreditorAccount"] = AccountNumberMask.Mask(request.CreditorAccountNumber),
+                ["PaymentScheme"] = request.PaymentScheme
+            };
     }
 }
